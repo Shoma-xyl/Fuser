@@ -1,0 +1,119 @@
+# ============================================================================
+# Phase 2 (UOT): end-to-end finetune with UQ head + UOT cross-modal completion.
+#
+# This is the MAIN Phase 2 configuration (paper's main method).
+# Gate-only variant lives in convfuser_uq_phase2_gate.yaml (baseline/ablation).
+#
+# Assumes a Phase-1 checkpoint with trained reliability head. Load via
+# --load_from. The UOT fuser has two extra projection MLPs (W_lid_to_cam
+# and W_cam_to_lid) that are randomly initialized; load_state_dict with
+# strict=False will warn about these "missing" keys — that's expected.
+#
+# What this does:
+#   - UQFuser with fusion_strategy="ot": cross-modal feature completion
+#     guided by per-cell uq.
+#   - Freezes only the two heaviest backbones (SwinT, SparseEncoder).
+#   - Trainable: FPN neck, DepthLSSTransform, reliability head, projection
+#     MLPs, fuser (including base_fuser conv), decoder, detection head.
+#   - Joint loss: detection + UQ BCE (small weight, regularizer).
+#   - 6 epochs with cosine decay.
+#   - gate_ramp=2000: at step 0, UOT path is effectively disabled
+#     (alpha=0 -> output identical to pretrained base_fuser), then
+#     alpha ramps linearly to 1 over the first 2000 steps.
+#
+# Memory note:
+#   UOT introduces unfold tensors of shape (B, 256, 49, 32400) which is
+#   ~3.3GB fp32 at B=2. Total peak is ~23-25GB on 32GB cards. If OOM:
+#     - Reduce samples_per_gpu to 1
+#     - Increase workers_per_gpu accordingly
+#
+# Run:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 tools/train.py \
+#     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser_uq_phase2.yaml \
+#     --run-dir runs/uq_phase2 \
+#     --load_from runs/uq_phase1/latest.pth
+#
+# Time estimate: ~8-10 hr/epoch on 4x32G at B=2 -> ~50-60 hr for 6 epochs.
+# UOT adds ~20% overhead vs gate-only.
+# ============================================================================
+
+samples_per_gpu: 2            # UOT needs extra memory for unfold tensors
+workers_per_gpu: 4
+max_epochs: 6
+
+# DDP safety: even though we removed the α=0 short-circuit so the
+# projection MLPs always run, find_unused_parameters=True gives us a
+# safety net in case any module becomes disconnected from the loss
+# graph under a rare condition (e.g. all-zero uq). Costs ~5% throughput.
+find_unused_parameters: true
+
+model:
+  type: BEVFusion
+
+  fuser:
+    type: UQFuser
+    in_channels: [80, 256]
+    out_channels: 256
+    fusion_strategy: ot         # UOT cross-modal completion
+    reliability:
+      hidden_ch: 256
+      init_bias: -4.0
+    # Gate ramp: at step 0, alpha=0, output matches pretrained exactly.
+    # Over 2000 steps, alpha ramps to 1 → UOT fully engaged.
+    gate_ramp_steps: 2000
+    # UOT hyperparameters.
+    ot_window: 7                # 7x7 local window → 49 neighbors per cell
+    ot_eps: 0.1                 # Sinkhorn entropy regularization
+    ot_lambda: 1.0              # UOT KL marginal-relaxation weight
+    ot_iters: 20                # Sinkhorn iterations (converges in 15-20)
+    proj_hidden: 128            # projection MLP bottleneck width
+
+  # UQ BCE loss continues as a regularizer to keep the head sensible.
+  # Low weight (0.1) means detection loss dominates, but BCE prevents
+  # the head from drifting into a trivial state during Phase 2.
+  uq_training:
+    enable: true
+    loss_weight: 0.1
+    label_smoothing: 0.05
+    loss_cam_weight: 2.0
+    loss_lid_weight: 1.0
+    cam_support_keep_frac: 0.5
+    clean_prob: 0.70              # Phase 2: 70% clean to avoid BN contamination
+    cam_prob: 0.20                # 20% cam corruption (was 45%)
+
+  # Freeze only the heavy backbones; everything else finetunes.
+  freeze:
+    - "encoders.camera.backbone."    # SwinT  (~30M params, ImageNet pretrained)
+    - "encoders.lidar.backbone."     # SparseEncoder (~5M params)
+
+  loss_scale:
+    object: 1.0
+    map: 1.0
+
+# Lowered from 1e-4 to 5e-5 for finetuning stability: we're loading a
+# near-optimal pretrained checkpoint, not training from scratch. Plus
+# the UOT path has randomly-initialized projection MLPs that need careful
+# shaping — too high LR would destabilize them.
+optimizer:
+  type: AdamW
+  lr: 5.0e-5
+  weight_decay: 0.01
+
+optimizer_config:
+  grad_clip:
+    max_norm: 35.0
+    norm_type: 2
+
+# Warmup iters match gate_ramp_steps so LR climbs while gate engages.
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 2000
+  warmup_ratio: 0.01
+  min_lr_ratio: 1.0e-3
+
+checkpoint_config:
+  interval: 1
+
+evaluation:
+  interval: 1

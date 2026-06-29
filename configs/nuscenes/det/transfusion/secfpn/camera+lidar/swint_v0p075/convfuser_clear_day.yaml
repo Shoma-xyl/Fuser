@@ -1,0 +1,25 @@
+# Clean/day pilot baseline.
+#
+# Train only on data/nuscenes/nuscenes_infos_train_clear_day.pkl.
+# Validate on the unchanged full nuScenes val split.
+
+max_epochs: 8
+gt_paste_stop_epoch: -1
+
+model:
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+data:
+  train:
+    dataset:
+      ann_file: ${dataset_root + "nuscenes_infos_train_clear_day.pkl"}
+  val:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}
+  test:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}
+
+evaluation:
+  interval: 1

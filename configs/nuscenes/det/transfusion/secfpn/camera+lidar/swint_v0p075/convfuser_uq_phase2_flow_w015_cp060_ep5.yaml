@@ -1,0 +1,100 @@
+# ============================================================================
+# Phase 2 (UQ-conditioned Flow Matching Fuser), stronger short-run ablation.
+#
+# Command:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 tools/train.py \
+#     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser_uq_phase2_flow_w015_cp060_ep5.yaml \
+#     --run-dir runs/uq_phase2_flow_w015_cp060_ep5 \
+#     --load_from runs/uq_phase1_v2/latest.pth
+#
+# Rationale:
+#   The previous run peaked at epoch 4, then flow became too aggressive near
+#   epoch 8. This config makes flow stronger early, but limits training to 5
+#   epochs so the run can test early repair strength without late saturation.
+# ============================================================================
+
+samples_per_gpu: 2
+workers_per_gpu: 4
+max_epochs: 5
+
+find_unused_parameters: true
+
+model:
+  type: BEVFusion
+
+  fuser:
+    type: UQFlowFuser
+    in_channels: [80, 256]
+    out_channels: 256
+    reliability:
+      hidden_ch: 256
+      init_bias: -4.0
+    cond_hidden_ch: 256
+    flow:
+      latent_ch: 256
+      cond_ch: 256
+      hidden_ch: 256
+      time_dim: 128
+      num_blocks: 6
+      groups: 8
+      max_velocity: 1.0
+
+  flow_training:
+    enable: true
+    enable_fm: true
+    apply_corruption: true
+    loss_weight: 0.15
+    fm_loss_type: smooth_l1
+    smooth_l1_beta: 0.1
+    clean_prob: 0.60
+    cam_prob: 0.25
+    num_steps: 1
+
+  freeze:
+    - "encoders."
+    - "fuser.reliability_head."
+    - "fuser.teacher_proj."
+
+  loss_scale:
+    object: 1.0
+    map: 1.0
+
+optimizer:
+  type: AdamW
+  lr: 5.0e-5
+  weight_decay: 0.01
+  paramwise_cfg:
+    custom_keys:
+      fuser.velocity_net:
+        lr_mult: 3.0
+      fuser.cond_proj:
+        lr_mult: 2.0
+      fuser.source_proj:
+        lr_mult: 0.5
+
+optimizer_config:
+  grad_clip:
+    max_norm: 35.0
+    norm_type: 2
+
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 2000
+  warmup_ratio: 0.01
+  min_lr_ratio: 1.0e-3
+
+checkpoint_config:
+  interval: 1
+
+evaluation:
+  interval: 1
+
+data:
+  train:
+    dataset:
+      ann_file: ${dataset_root + "nuscenes_infos_train_clear_day.pkl"}
+  val:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}
+  test:
+    ann_file: ${dataset_root + "nuscenes_infos_val.pkl"}

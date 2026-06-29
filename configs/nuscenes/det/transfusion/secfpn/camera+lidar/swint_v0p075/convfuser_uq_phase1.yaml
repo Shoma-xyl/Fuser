@@ -1,0 +1,95 @@
+# ============================================================================
+# Phase 1: train the reliability head only.
+#
+# Inherits everything in this directory (SwinT + voxel + default optimizer
+# + LR schedule from default.yaml, etc.) via torchpack's recursive config
+# load. Only the diff is specified here.
+#
+# What this does:
+#   - Swaps ConvFuser -> UQFuser (adds reliability head + gate)
+#   - Freezes everything EXCEPT the reliability head
+#   - Disables detection loss (loss_scale: 0); only UQ BCE drives learning
+#   - Applies synthetic corruption (5 types) on 60% of training samples
+#   - Trains for 3 epochs
+#
+# Run:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 tools/train.py \
+#     configs/nuscenes/det/transfusion/secfpn/camera+lidar/swint_v0p075/convfuser_uq_phase1.yaml \
+#     --run-dir runs/uq_phase1 \
+#     --load_from pretrained/bevfusion-det.pth
+#
+# Time estimate: ~1-2 hr on 4x32G. UQ head is only 1.73M params; most
+# of the time is the frozen forward pass through the full BEVFusion.
+# ============================================================================
+
+samples_per_gpu: 4
+workers_per_gpu: 4
+max_epochs: 3
+
+model:
+  type: BEVFusion
+
+  fuser:
+    type: UQFuser
+    in_channels: [80, 256]
+    out_channels: 256
+    fusion_strategy: gate
+    reliability:
+      hidden_ch: 256
+      init_bias: -4.0
+
+  # Enable UQ training: corruption + BCE loss on reliability head.
+  uq_training:
+    enable: true
+    loss_weight: 1.0           # Phase 1: only UQ BCE trains anything.
+    label_smoothing: 0.0
+    # v2: bias the loss toward CAM since CAM side is harder to learn.
+    # 3.0 worked well dynamically (cam acc 0.59->0.78 in 800 steps) but
+    # was close to fp16 gradient-magnitude limits. 2.0 is safer with
+    # similar benefit given the BCE-with-logits rewrite in v3 is
+    # now numerically stable.
+    loss_cam_weight: 2.0
+    loss_lid_weight: 1.0
+    cam_support_keep_frac: 0.5
+
+  # Freeze everything except reliability_head.
+  # Prefixes correspond to parameter names under the model root.
+  freeze:
+    - "encoders."
+    - "decoder."
+    - "heads."
+    - "fuser.base_fuser."      # keep pretrained convfuser weights frozen too
+
+  # Detection & map losses contribute 0 gradient (frozen anyway but this
+  # also saves autograd memory because the tensors won't flow back).
+  loss_scale:
+    object: 0.0
+    map: 0.0
+
+# ---- Optimizer: only the reliability head has trainable params ----
+# Since `freeze` above already set requires_grad=False everywhere else,
+# AdamW will only touch reliability head parameters.
+optimizer:
+  type: AdamW
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+optimizer_config:
+  grad_clip:
+    max_norm: 10.0
+    norm_type: 2
+
+# Override the parent default's CosineAnnealing with a shorter warmup
+# since we're only training a small head for 3 epochs.
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 500
+  warmup_ratio: 0.01
+  min_lr_ratio: 1.0e-3
+
+checkpoint_config:
+  interval: 1
+
+evaluation:
+  interval: 999       # skip evaluation (mAP is meaningless during UQ-only training)
